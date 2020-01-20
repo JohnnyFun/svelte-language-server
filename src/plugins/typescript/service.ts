@@ -1,7 +1,7 @@
 import ts from 'typescript';
 import { DocumentSnapshot } from './DocumentSnapshot';
 import { isSvelte } from './utils';
-import { dirname, resolve, extname } from 'path';
+import { dirname } from 'path';
 import { Document } from '../../api';
 
 export interface LanguageServiceContainer {
@@ -60,6 +60,9 @@ export function createLanguageService(
             tsconfigPath,
             undefined,
             [
+                // these might not be getting listened to at all. Pretty sure they should be '.html' and '.svelte'
+                // but even if you add that (and set `scriptKind`), ts loads svelte files too, but it doesn't resolve them, so
+                // I'm just resolving them in sveltePlugin instead
                 { extension: 'html', isMixedContent: true },
                 { extension: 'svelte', isMixedContent: true },
             ],
@@ -95,10 +98,11 @@ export function createLanguageService(
                     ts.sys,
                 );
 
-                if (!resolved.resolvedModule && isSvelte(name)) {
+                if (!resolved.resolvedModule) {
+                    // SveltePlugin will handle
                     return {
-                        resolvedFileName: resolve(dirname(containingFile), name),
-                        extension: extname(name),
+                        resolvedFileName: '',
+                        extension: null
                     };
                 }
 
