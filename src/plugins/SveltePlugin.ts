@@ -15,18 +15,22 @@ import {
     CompletionItemKind,
     DefinitionLink,
     LocationLink,
+    CompletionItem,
+    FragmentPredicate,
+    MarkupContent,
 } from '../api';
 import { SvelteDocument } from '../lib/documents/SvelteDocument';
 import { RawSourceMap, RawIndexMap, SourceMapConsumer } from 'source-map';
 import { CompileOptions, Warning } from 'svelte/types/compiler/interfaces';
 import { importSvelte, getSveltePackageInfo } from './svelte/sveltePackage';
 import { PreprocessorGroup } from 'svelte/types/compiler/preprocess';
-import path, { resolve, dirname } from 'path'
+import path, { resolve, dirname, basename } from 'path'
 import fs from 'fs'
 import { pathToUrl } from '../utils';
-import ts from 'typescript';
+import ts, { PostfixUnaryExpression } from 'typescript';
 import { TextDocument } from '../lib/documents/TextDocument';
 import { convertRange, isSvelte } from './typescript/utils';
+import { TypeScriptPlugin } from './TypeScriptPlugin';
 
 interface SvelteConfig extends CompileOptions {
     preprocess?: PreprocessorGroup;
@@ -130,43 +134,80 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
             return null;
         }
 
+        // TODO: not sure if need. try in non-svelte|html file...
         // const html = this.documents.get(document);
         // if (!html) {
         //     return null;
         // }
 
-        // TODO: add results for possible svelte components and autoimport them if they're not already imported upon clicking...
         this.hydrateSvelteFiles(document)
 
-        // const match = this.svelteFiles?.filter(f => this.isResolveMatch(f, ))
-
-        let svelteResults: CompletionList = {
-            isIncomplete: true,
-            items: [
-                {
-                    label: "SomeSexyComponent",
-                    documentation: "Will auto-import SomeSexyComponent if it's not already imported YAY!",
-                    kind: CompletionItemKind.Text, // or Module, // or class?
-                    textEdit: {    
-                        newText: "SomeSexyComponent />",
-                        range: {
-                            start: { line: 100, character: 3 },
-                            end: { line: 100, character: 3 }
-                        }
-                    },
-                    additionalTextEdits: [{
-                        newText: "import SomeSexyComponent from 'components/SomeSexyCompent.svelte'\n\t",
-                        range: {
-                            // would need to determine line of <script> or use vs-code helpers to find it?
-                            start: { line: 104, character: 2 },
-                            end: { line: 104, character: 2 }
-                        }
-                    }]
-                }
-            ]
+        // get auto-complete options for component name (and auto-import if needed)
+        /*
+            TODO: Tests
+            - puts "<" if previous char is not "{" or "<"
+            - does not add import if there is already an import
+            - auto-imports when no <script> tag
+            - auto-imports when <script> tag
+            - auto-imports non-relative, falling back to relative
+        */
+        const docDir = dirname(document.getFilePath()!)
+        const start = document.offsetAt(position)
+        const docText = document.getText()
+        const componentName = getPotentialComponentName(docText, start)
+        const importedPath = getImportPathFromComponentName(docText, componentName)
+        if (importedPath) return null // already imported. TODO: would be nice to go fetch any exported props for this component at this point instead
+        const matches = this.tryResolveLoose(componentName, docDir)
+        if (matches.length === 0) return null
+        const scriptFragment = document.findFragment(TypeScriptPlugin.matchFragment)
+        const noScriptFragment = scriptFragment == null || scriptFragment.details == null || scriptFragment.details.start == null
+        const scriptLine = scriptFragment == null || scriptFragment.details == null || scriptFragment.details.start == null ? 
+            document.lineCount - 1 : // if no script tag, we'll add one with the import at the bottom of the file
+            document.positionAt(scriptFragment.details.start).line + 1 // insert after the opening script tag
+        const startOfPosition = {
+            line: position.line,
+            character: position.character - componentName.length
         }
-
-        const list = CompletionList.create([...svelteResults.items], true);
+        const positionRange = {
+            start: startOfPosition,
+            end: startOfPosition
+        }
+        const prevCharIndex = start - componentName.length - 1
+        const previousCharacter = prevCharIndex > -1 ? docText[prevCharIndex] : null
+        const needsOpeningBracket = previousCharacter == null ? true : !/[<{]/.test(previousCharacter) // if there is a "{" or "<" directly before, don't insert a "<"
+        const componentCompletions: CompletionItem[] = matches.map(m => {
+            const fileName = removeSvelteOrHtmlExt(basename(m))
+            const alreadyImported = getImportPathFromName(docText, fileName)
+            let additionalTextEdits:TextEdit[]= []
+            let markdown = fileName
+            if (!alreadyImported) {
+                const determinedModulePath = this.unResolve(docDir, m)
+                const importText = `\timport ${fileName} from '${determinedModulePath}'\n`
+                const additionalEdit = noScriptFragment ? `\n<script>\n${importText}\n</script>` : importText
+                markdown = `##### Auto-import from '${determinedModulePath}'\n\`${additionalEdit}\``
+                additionalTextEdits.push({
+                    newText: additionalEdit,
+                    range: {
+                        start: { line: scriptLine, character: 0 },
+                        end: { line: scriptLine, character: 0 }
+                    }
+                })
+            }
+            return {
+                label: fileName,
+                documentation: {
+                    kind: 'markdown',
+                    value: markdown
+                },
+                kind: CompletionItemKind.Text, // or Module, // or class?
+                textEdit: {    
+                    newText: `${needsOpeningBracket ? '<' : ''}${fileName}`,
+                    range: positionRange
+                },
+                additionalTextEdits
+            }
+        })      
+        const list = CompletionList.create(componentCompletions, true);
         return list
     }
 
@@ -175,16 +216,18 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
             return [];
         }
         this.hydrateSvelteFiles(document)
+        const docDir = dirname(document.getFilePath()!)
         const start = document.offsetAt(position)
         const docText = document.getText()
-        const modulePath = getImportPathFromStart(docText, start)
+        const componentName = getPotentialComponentName(docText, start)
+        const modulePath = getImportPathFromComponentName(docText, componentName)
         if (modulePath === null) return []
-        const docDir = dirname(document.getFilePath()!)
         const matches = this.tryResolve(modulePath, docDir)
+        if (matches.length === 0) return []
         const docs = new Map<string, Document>([[docDir, document]]);
         const range = {
-            start,
-            length: modulePath.length // should really highlight what they clicked on...whatever for now...
+            start: start - 2,
+            length: 5 // TODO: highlight what they clicked (the found "componentName" pretty much, around "start")
         }
         return matches
             .map(resolved => {
@@ -220,6 +263,79 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
         return matches
     }
 
+    // given absolute path, return a 
+    private unResolve(docDir:string, absoluteFile:string) {
+        // determine which basepath works and use that as a start point
+        if (this.basePaths == null) return fixSlashes(absoluteFile) // shouldn't happen, but better to give them something useful
+        const absNoExtension = removeSvelteOrHtmlExt(absoluteFile)
+        if (this.basePaths.length === 0) {
+            const relative = relativeFromAbsolute(docDir, absoluteFile)
+            return relative
+        }
+        for (let i = 0; i < this.basePaths.length; i++) {
+            const base = this.basePaths[i];
+            const works = absNoExtension.startsWith(base)
+            if (works) {
+                let result = absNoExtension.replace(base, '')
+                result = result
+                return fixSlashes(result)
+            }
+        }
+        return fixSlashes(absoluteFile) // shouldn't happen, but better to give them something useful
+
+        function fixSlashes(file:string):string {
+            return forwardSlashes(removeStartSlash(file))
+        }
+
+        function removeStartSlash(file:string):string {
+            return file.replace(/^[/\\]/, '') // remove beginning slash if any
+        }
+
+        function forwardSlashes(file:string):string {
+            return file.replace(/\\/g, '/')
+        }
+
+        /*
+        TODO: Tests:            
+            console.log(relativeFromAbsolute('C:\\dev\\project\\components', 'c:/dev/project/components/sub/MyComponent.svelte'), 'should be', './sub/MyComponent.svelte') // also mix slashes and case
+            console.log(relativeFromAbsolute('c:/dev/project/components/', 'c:/dev/project/components/sub/MyComponent.svelte'), 'should be', './sub/MyComponent.svelte') // down 1
+            console.log(relativeFromAbsolute('c:/dev/project/components/', 'c:/dev/project/components/sub/sub2/MyComponent.svelte'), 'should be', './sub/sub2/MyComponent.svelte') // down 2
+            console.log(relativeFromAbsolute('c:/dev/project/components/sub', 'c:/dev/project/components/MyComponent.svelte'), 'should be ', '../MyComponent.svelte') // up 1
+            console.log(relativeFromAbsolute('c:/dev/project/components/sub/sub2', 'c:/dev/project/components/MyComponent.svelte'), 'should be ', '../../MyComponent.svelte') // up 2
+        */
+        function relativeFromAbsolute(currDir:string, absolutePath:string):string {
+            // normalize slashes and casing
+            absolutePath = path.resolve(path.dirname(absolutePath.toLowerCase()), path.basename(absolutePath)) // retain file capitalization
+            currDir = path.resolve(currDir.toLowerCase())
+
+            // go up or down as needed
+            const goingDown = absolutePath.startsWith(currDir)
+            if (goingDown) {
+                const relative = './' + removeStartSlash(absolutePath.replace(currDir, ''))
+                return forwardSlashes(relative)
+            } else {
+                let start = ''
+                let max = 100
+                let i = 0
+                while (!absolutePath.startsWith(currDir)) {
+                currDir = path.resolve(currDir, '../')
+                start += '../'
+                max++
+                if (i > max) break; // could be in different drive
+                }
+                return forwardSlashes(start + removeStartSlash(absolutePath.replace(currDir, '')))
+            }
+        }
+    }
+
+    private tryResolveLoose(search: string, docDir: string) : string[] {
+        if (this.svelteFiles === null) return []
+        const matches = this.svelteFiles.filter(f => {
+            const fileName = basename(f).toLowerCase()
+            return fileName.indexOf(search.toLowerCase()) > -1
+        })
+        return matches
+    }
 
     async getDiagnostics(document: Document): Promise<Diagnostic[]> {
         if (!this.host.getConfig<boolean>('svelte.diagnostics.enable')) {
@@ -448,8 +564,6 @@ function mapFragmentPositionBySourceMap(
     return source.positionInParent(sourcePosition);
 }
 
-
-
 /* TODO (just POC for now)
     - extract this somewhere as a class or add methods to "Document"...
     - consider refactoring to use an abstract syntax tree instead of regex
@@ -470,46 +584,49 @@ function mapFragmentPositionBySourceMap(
         console.log(getPotentialComponentName('</Something>', 4), 'should be', 'Something')
         console.log(getPotentialComponentName('<Something>', 4), 'should be', 'Something')
 */
-function getImportPathFromStart(docText:string, start:number) {
-    const componentName = getPotentialComponentName(docText, start)
+function getImportPathFromComponentName(docText:string, componentName: string) {
     const importPath = getImportPathFromName(docText, componentName)
     return importPath
-    
-    function getImportPathFromName(docText:string, name:string) : string | null {
-        const match = new RegExp(`import ${name} from ['"]([^['"]+)['"]`, 'i').exec(docText)
-        if (match == null) return null
-        return match[1]
-    }
+}
 
-    function getPotentialComponentName(docText:string, start:number) : string {
-        const importedName = tryGetImportName(docText, start)
-        if (importedName != null) return importedName
-        const validNameChars = /[a-zA-Z0-9]/
-        const name = getTextAround(docText, start, validNameChars)
-        return name
+function getImportPathFromName(docText:string, name:string) : string | null {
+    const match = new RegExp(`import ${name} from ['"]([^['"]+)['"]`, 'i').exec(docText)
+    if (match == null) return null
+    return match[1]
+}
+
+function getPotentialComponentName(docText:string, start:number) : string {
+    const importedName = tryGetImportName(docText, start)
+    if (importedName != null) return importedName
+    const validNameChars = /[a-zA-Z0-9]/
+    const name = getTextAround(docText, start, validNameChars)
+    return name
+}
+
+function tryGetImportName(docText:string, start:number) : string | null {
+    const line = getTextAround(docText, start, /[^$^\n\r]+/m)
+    const match = /import ([a-zA-Z0-9]+) from/.exec(line)
+    return match == null ? null : match[1]
+}
+
+function getTextAround(docText:string, start:number, regex:RegExp) : string {
+    let text = ''
+    let forward = start
+    let backward = start
+    let max = docText.length
+    while (forward < max) {
+    if (regex.test(docText[forward])) text += docText[forward]
+    else break
+    forward++
     }
-    
-    function tryGetImportName(docText:string, start:number) : string | null {
-        const line = getTextAround(docText, start, /[^$^\n\r]+/m)
-        const match = /import ([a-zA-Z0-9]+) from/.exec(line)
-        return match == null ? null : match[1]
+    while (backward > 0) {
+    backward--
+    if (regex.test(docText[backward])) text = docText[backward] + text
+    else break
     }
-    
-    function getTextAround(docText:string, start:number, regex:RegExp) : string {
-        let text = ''
-        let forward = start
-        let backward = start
-        let max = docText.length
-        while (forward < max) {
-        if (regex.test(docText[forward])) text += docText[forward]
-        else break
-        forward++
-        }
-        while (backward > 0) {
-        backward--
-        if (regex.test(docText[backward])) text = docText[backward] + text
-        else break
-        }
-        return text
-    }
+    return text
+}
+
+function removeSvelteOrHtmlExt(fileName) {
+    return fileName.replace(/\.(?:svelte|html)$/, '')
 }

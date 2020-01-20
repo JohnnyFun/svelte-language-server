@@ -230,7 +230,10 @@ export class TypeScriptPlugin
         const docs = new Map<string, Document>([[document.getFilePath()!, document]]);
 
         return defs.definitions
-            .filter(def => def.fileName.indexOf('ambient.d.ts') === -1) // TODO: why does ts resolve to this for some svelte imports?
+            
+            // TODO: why does ts resolve to this for some svelte imports? Also, should instead try to find the svelte file here too, so you can go-to-def from a js file that references a .svelte file
+            .filter(def => def.fileName.indexOf('ambient.d.ts') === -1) 
+
             .map(def => {
                 let defDoc = docs.get(def.fileName);
                 if (!defDoc) {
