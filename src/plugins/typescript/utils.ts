@@ -1,5 +1,6 @@
 import ts from 'typescript';
 import { Document, Range, SymbolKind, CompletionItemKind, DiagnosticSeverity } from '../../api';
+import { extname } from 'path';
 
 export function getScriptKindFromFileName(fileName: string): ts.ScriptKind {
     const ext = fileName.substr(fileName.lastIndexOf('.'));
@@ -34,8 +35,21 @@ export function getScriptKindFromAttributes(attrs: Record<string, string>): ts.S
 }
 
 export function isSvelte(filePath: string) {
-    return filePath.endsWith('.html') || filePath.endsWith('.svelte');
+    return isExtension(filePath, ['.html', '.svelte'])
 }
+
+export function isJs(filePath: string) {
+    return isExtension(filePath, ['.js', '.mjs', '.ts', '.tsx'])
+}
+
+function isExtension(file: string, extensions: string[]) : boolean {
+    return extensions.some(ext => ext === extname(file).toLowerCase())
+}
+
+export function removeExt(filePath: string) : string {
+    return filePath.replace(/\.[^/.]+$/, "")
+}
+
 
 export function convertRange(
     document: Document,

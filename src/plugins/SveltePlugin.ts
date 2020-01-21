@@ -29,7 +29,7 @@ import fs from 'fs'
 import { pathToUrl } from '../utils';
 import ts, { PostfixUnaryExpression } from 'typescript';
 import { TextDocument } from '../lib/documents/TextDocument';
-import { convertRange, isSvelte } from './typescript/utils';
+import { convertRange, isSvelte, removeExt } from './typescript/utils';
 import { TypeScriptPlugin } from './TypeScriptPlugin';
 
 interface SvelteConfig extends CompileOptions {
@@ -50,7 +50,7 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
 
     private host!: Host;
     private basePaths: string[] | null = null
-    private svelteFiles: string[] | null = null
+    private files: string[] | null = null
 
     onRegister(host: Host) {
         this.host = host;
@@ -58,7 +58,7 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
 
     private hydrateSvelteFiles(document: Document) {
         // TODO: modify this.basePaths when any files are added/deleted
-        const hydrated = this.svelteFiles !== null
+        const hydrated = this.files !== null
         if (hydrated) return
         
         // hacky/incomplete implementation to get basic support for tsconfig/jsconfig module resolution
@@ -66,16 +66,15 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
         const docPath = document.getFilePath()
 
         // silently return if no doc path...doesn't seem like that would happen anyway
-        if (docPath == null) return 
+        if (docPath == null) return
         const startPath = path.dirname(docPath) 
         this.basePaths = Array.from(getResolvedAliasPaths(startPath))
-        this.svelteFiles = getAllSvelteOrHTMLFiles(this.basePaths)
+        this.files = getAllFiles(this.basePaths)
 
-        function getAllSvelteOrHTMLFiles(basePaths: string[]) : string[] {
+        function getAllFiles(basePaths: string[]) : string[] {
             return Array.from(basePaths).map(base => {
                 const allFiles = walkSync(base)
-                const svelteFiles = allFiles.filter(f => ['.svelte', '.html'].some(ext => ext === path.extname(f).toLowerCase()))
-                return svelteFiles
+                return allFiles
             }).reduce((a, b) => [...a, ...b], [])
         }
 
@@ -142,7 +141,7 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
 
         this.hydrateSvelteFiles(document)
 
-        // get auto-complete options for component name (and auto-import if needed)
+        // get auto-complete options for component or module name (and auto-import if needed)
         /*
             TODO: Tests
             - puts "<" if previous char is not "{" or "<"
@@ -150,11 +149,20 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
             - auto-imports when no <script> tag
             - auto-imports when <script> tag
             - auto-imports non-relative, falling back to relative
+            - auto-imports svelte or js files
+                - don't offer svelte file options if in <script> block though. offer both from template context.
+            - don't auto-complete if dotting into something like:
+                - api.
         */
+       const docText = document.getText()
+       const start = document.offsetAt(position)
+       const componentName = getPotentialComponentName(docText, start)
+        const prevCharIndex = start - componentName.length - 1
+        const previousCharacter = prevCharIndex > -1 ? docText[prevCharIndex] : null
+        if (previousCharacter === '.') {
+            return null // dotting into something, so don't auto-complete
+        }
         const docDir = dirname(document.getFilePath()!)
-        const start = document.offsetAt(position)
-        const docText = document.getText()
-        const componentName = getPotentialComponentName(docText, start)
         const importedPath = getImportPathFromComponentName(docText, componentName)
         if (importedPath) return null // already imported. TODO: would be nice to go fetch any exported props for this component at this point instead
         const matches = this.tryResolveLoose(componentName, docDir)
@@ -172,11 +180,10 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
             start: startOfPosition,
             end: startOfPosition
         }
-        const prevCharIndex = start - componentName.length - 1
-        const previousCharacter = prevCharIndex > -1 ? docText[prevCharIndex] : null
         const needsOpeningBracket = previousCharacter == null ? true : !/[<{]/.test(previousCharacter) // if there is a "{" or "<" directly before, don't insert a "<"
         const componentCompletions: CompletionItem[] = matches.map(m => {
-            const fileName = removeSvelteOrHtmlExt(basename(m))
+            const isSvelteFile = isSvelte(m)
+            const fileName = removeExt(basename(m))
             const alreadyImported = getImportPathFromName(docText, fileName)
             let additionalTextEdits:TextEdit[]= []
             let markdown = fileName
@@ -201,7 +208,7 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
                 },
                 kind: CompletionItemKind.Text, // or Module, // or class?
                 textEdit: {    
-                    newText: `${needsOpeningBracket ? '<' : ''}${fileName}`,
+                    newText: `${needsOpeningBracket && isSvelteFile ? '<' : ''}${fileName}`,
                     range: positionRange
                 },
                 additionalTextEdits
@@ -251,7 +258,7 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
     }
 
     private tryResolve(modulePath: string, docDir: string) : string[] {
-        if (this.svelteFiles === null || this.basePaths === null) return []
+        if (this.files === null || this.basePaths === null) return []
         const defaultSvelteExtension = '.svelte'
         const nameWithExt = isSvelte(modulePath) ? modulePath : modulePath + defaultSvelteExtension
         const relative = resolve(docDir, nameWithExt)
@@ -259,7 +266,7 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
             ...this.basePaths.map(base => resolve(docDir, base, nameWithExt)), // if aliased and found by tsconfig's file-finding algorithm
             relative // if relative
         ]
-        const matches = this.svelteFiles.filter(f => namesToCheck.some(n => f.toLowerCase().endsWith(n.toLowerCase())))
+        const matches = this.files.filter(f => namesToCheck.some(n => f.toLowerCase().endsWith(n.toLowerCase())))
         return matches
     }
 
@@ -267,7 +274,7 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
     private unResolve(docDir:string, absoluteFile:string) {
         // determine which basepath works and use that as a start point
         if (this.basePaths == null) return fixSlashes(absoluteFile) // shouldn't happen, but better to give them something useful
-        const absNoExtension = removeSvelteOrHtmlExt(absoluteFile)
+        const absNoExtension = removeExt(absoluteFile)
         if (this.basePaths.length === 0) {
             const relative = relativeFromAbsolute(docDir, absoluteFile)
             return relative
@@ -329,8 +336,8 @@ export class SveltePlugin implements DiagnosticsProvider, FormattingProvider {
     }
 
     private tryResolveLoose(search: string, docDir: string) : string[] {
-        if (this.svelteFiles === null) return []
-        const matches = this.svelteFiles.filter(f => {
+        if (this.files === null) return []
+        const matches = this.files.filter(f => {
             const fileName = basename(f).toLowerCase()
             return fileName.indexOf(search.toLowerCase()) > -1
         })
@@ -564,7 +571,7 @@ function mapFragmentPositionBySourceMap(
     return source.positionInParent(sourcePosition);
 }
 
-/* TODO (just POC for now)
+/* TODO: (just POC for now)
     - extract this somewhere as a class or add methods to "Document"...
     - consider refactoring to use an abstract syntax tree instead of regex
     - handle scenarios:
@@ -625,8 +632,4 @@ function getTextAround(docText:string, start:number, regex:RegExp) : string {
     else break
     }
     return text
-}
-
-function removeSvelteOrHtmlExt(fileName) {
-    return fileName.replace(/\.(?:svelte|html)$/, '')
 }
